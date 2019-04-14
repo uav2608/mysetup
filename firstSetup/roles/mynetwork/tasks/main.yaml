@@ -1,71 +1,96 @@
 ---
-- name: Make sure to have Wheel group
-  group:
-      name: wheel
-      state: present
+- name: Add the OS specific varibles
+  include_vars: "{{ ansible_os_family }}.yaml"
 
-- name: Add user to Wheel group
-  user:
-      name: "{{ ansible_user }}"
-      groups: wheel
+- name: Include specific tasks for the RedHat family
+  include: redhat.yaml
+  when: ansible_os_family == 'RedHat'
 
-- name: Update sudoer file
+- name: Include specific tasks for the Debian family
+  include: debian.yaml
+  when: ansible_os_family == "Debian"
+
+- name: Create the network configuration file for ethernet interfaces
+  template:
+    src: "ethernet_{{ ansible_os_family }}.j2"
+    dest: "{{ net_path }}/ifcfg-{{ item.device }}"
+  with_items: "{{ network_ether_interfaces }}"
+  when: network_ether_interfaces is defined
+  register: ether_result
+
+- name: Create the network configuration file for vlan devices
+  template:
+    src: "ethernet_{{ ansible_os_family }}.j2"
+    dest: "{{ net_path }}/ifcfg-{{ item.device }}"
+  with_items: "{{ network_vlan_interfaces }}"
+  when: network_vlan_interfaces
+  register: vlan_result
+
+- name: Make sure the 8021q module is loaded
+  modprobe:
+    name: 8021q
+    state: present
+  when: vlan_result is changed
+
+- name: Make the 8021q module persistent
+  become: true
   lineinfile:
-      path: /etc/sudoers
-      state: present
-      regexp: '^%wheel\s'
-      line: '%wheel ALL=(ALL) NOPASSWD: ALL'
-      validate: '/usr/sbin/visudo -cf %s'
+    line: '8021q'
+    dest: /etc/modules
+    insertafter: EOF
+  when:
+    - network_vlan_interfaces
+    - network_modprobe_persist
 
-- name: create a .ssh directory if it doesn't exist
-  file:
-      path:  /home/{{ ansible_user }}/.ssh
-      state: directory
-      owner: "{{ ansible_user }}"
-      group: "{{ ansible_user }}"
-      mode: 0700
+- name: Create the network configuration file for bridge devices
+  template:
+    src: "bridge_{{ ansible_os_family }}.j2"
+    dest: "{{ net_path }}/ifcfg-{{ item.device }}"
+  with_items: "{{ network_bridge_interfaces }}"
+  when: network_bridge_interfaces is defined
+  register: bridge_result
 
-- name: create file
-  file:
-      path: /home/{{ ansible_user }}/.ssh/authorized_keys
-      state: touch
-      owner: "{{ ansible_user }}"
-      group: "{{ ansible_user }}"
-      mode: 0644
-      modification_time: "preserve"
-      access_time: "preserve"
+- name: Create the network configuration file for port on the bridge devices
+  template:
+    src: "bridge_port_{{ ansible_os_family }}.j2"
+    dest: "{{ net_path }}/ifcfg-{{ item.1 }}"
+  with_subelements:
+    - '{{ network_bridge_interfaces }}'
+    - bridge_ports
+  when: network_bridge_interfaces is defined
+  register: bridge_port_result
 
-- name: Copy authorized_keys
-  lineinfile:
-      path: /home/{{ ansible_user }}/.ssh/authorized_keys
-      state: present
-      line: "{{ auth_key_initial }}"
+# Restart Network Interfaces (deconfigurate & reconfigurate interfaces)
+- include: restartscript.yaml
+  when: network_allow_service_restart and ansible_os_family == 'Debian'
 
-#- name: create file
-#  file:
-#      path: /etc/sysconfig/network-scripts/ifcfg-ens37
-#      state: touch
-#      owner: root
-#      group: root
-#      mode: 0644
-#      modification_time: "preserve"
-#      access_time: "preserve"
+- name: Enable the "network" service
+  service:
+    name: network
+    enabled: true
+  check_mode: yes
+  register: network_service
+  ignore_errors: true
+  when: network_allow_service_restart and ansible_os_family == 'RedHat'
 
-#- name: Make network interface up
-#  net_interface:
-#      name: ifcfg-ens37
-#      enabled: True 
+- name: Verify if the "network" service is enabled
+  set_fact:
+    network_service_enabled: "{{ not network_service.failed
+        and not network_service.changed }}"
+  when: network_allow_service_restart and ansible_os_family == 'RedHat'
 
-#- name: Assign static IP
-#  template:
-#      src: static_ip
-#      dest: /etc/sysconfig/network-scripts/ifcfg-ens37
-#      owner: root
-#      group: root
-#      mode: 0644
-
-#- name: Restart network
-#  service:
-#     name: network
-#     state: restarted
+- name: Restart the "network" service on Red Hat systems
+  service:
+    name: network
+    state: restarted
+  when: >
+    (network_allow_service_restart
+     and ansible_os_family == 'RedHat'
+     and network_service_enabled)
+     and (ether_result is changed
+          or bond_port_result is changed
+          or bond_result is changed
+          or vlan_result is changed
+          or bridge_result is changed
+          or bridge_port_result is changed)
 
